@@ -118,7 +118,7 @@ jobs:
           # "latest" mode → no extra args (default script behaviour)
 
           echo "Running: python update_dataset.py $ARGS"
-          python update_dataset.py $ARGS
+          python scripts/update_dataset.py $ARGS
 
       # -----------------------------------------------------------------------
       # 7. Upload the updated CSV as a GitHub Actions artifact.
