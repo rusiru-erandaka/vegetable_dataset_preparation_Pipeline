@@ -96,7 +96,7 @@ jobs:
       #    The mode input from workflow_dispatch controls the arguments.
       #    On a scheduled run (no input), it defaults to "latest".
       # -----------------------------------------------------------------------
-      - name: Run update_dataset.py --backfill --max-pages 114
+      - name: Run update_dataset.py
         env:
           # These secrets must be set in your GitHub repository:
           # Settings → Secrets and variables → Actions → New repository secret
