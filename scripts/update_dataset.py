@@ -423,8 +423,52 @@ def build_wide_row(
 # CSV persistence
 # ---------------------------------------------------------------------------
 
+# Columns that the old long-format pipeline wrote but the wide-format pipeline
+# does NOT use. These are dropped automatically when loading any existing CSV,
+# so old files are migrated on first run without any manual intervention.
+_LEGACY_COLUMNS = [
+    "item", "unit",
+    "retail_pettah", "retail_dambulla", "retail_narahenpita",
+    "wholesale_pettah", "wholesale_dambulla",
+]
+
+
 def load_existing_df() -> pd.DataFrame:
-    return pd.read_csv(CSV_PATH) if CSV_PATH.exists() else pd.DataFrame()
+    """
+    Load the existing CSV, auto-migrating away from the old long format.
+
+    WHY: The first version of this pipeline wrote one row per item per date
+    (long format) with generic column names like 'retail_pettah'. After
+    switching to wide format those columns became empty ghosts in the CSV.
+    Dropping them here means the dataset self-heals on any machine without
+    needing a separate migration script.
+
+    Also drops any rows that have no wide-format price data at all — these
+    are rows that were written by the old pipeline for dates where the new
+    pipeline hasn't run yet.
+    """
+    if not CSV_PATH.exists():
+        return pd.DataFrame()
+
+    df = pd.read_csv(CSV_PATH)
+
+    # Drop legacy columns if present (silently ignore if already gone)
+    legacy_present = [c for c in _LEGACY_COLUMNS if c in df.columns]
+    if legacy_present:
+        print(f"  [migrate] Dropping {len(legacy_present)} legacy columns: {legacy_present}")
+        df = df.drop(columns=legacy_present)
+
+    # Drop rows that have no wide-format price data.
+    # We use wholesale_pettah_Beans as a sentinel — it is always populated
+    # for any correctly-processed date.
+    sentinel = "wholesale_pettah_Beans"
+    if sentinel in df.columns:
+        bad_rows = df[sentinel].isna().sum()
+        if bad_rows:
+            print(f"  [migrate] Dropping {bad_rows} rows with no wide-format data.")
+            df = df[df[sentinel].notna()]
+
+    return df.reset_index(drop=True)
 
 
 def save_csv(df: pd.DataFrame) -> None:
