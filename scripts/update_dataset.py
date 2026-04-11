@@ -264,7 +264,7 @@ CBSL_PDF_BASE = (
 
 # Earliest date CBSL has PDFs online with the same format we can parse.
 # Verified: the PDF table structure (page 2) is identical back to at least 2020.
-CBSL_HISTORY_START = datetime(2020, 1, 1)
+CBSL_HISTORY_START = datetime(2023, 1, 1)
 
 
 def _pdf_url(date_str: str) -> str:
