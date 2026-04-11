@@ -11,7 +11,7 @@ Pipeline to:
 Run modes
 ---------
   python update_dataset.py                        # process only the latest PDF
-  python update_dataset.py --backfill             # probe & fill ALL weekdays since 2023-01-01
+  python update_dataset.py --backfill             # probe & fill ALL weekdays since 2020-01-01
   python update_dataset.py --backfill --start-date 2024-01-01   # backfill from a specific date
   python update_dataset.py --force                # re-process latest even if already exists
 
@@ -269,7 +269,7 @@ CBSL_PRICE_REPORT_URL = (
 PDF_LINK_RE = re.compile(r"https?://[^\"']+price_report_(\d{8})_e\.pdf")
 
 # Earliest date CBSL has PDFs online (adjust if you need to go further back)
-CBSL_HISTORY_START = datetime(2023, 1, 1)
+CBSL_HISTORY_START = datetime(2020, 1, 1)
 
 
 def _pdf_url(date_str: str) -> str:
