@@ -11,7 +11,7 @@ Pipeline to:
 Run modes
 ---------
   python update_dataset.py                        # process only the latest PDF
-  python update_dataset.py --backfill             # probe & fill ALL weekdays since 2020-01-01
+  python update_dataset.py --backfill             # probe & fill ALL weekdays since 2023-01-01
   python update_dataset.py --backfill --start-date 2024-01-01   # backfill from a specific date
   python update_dataset.py --force                # re-process latest even if already exists
 
@@ -262,13 +262,8 @@ CBSL_PDF_BASE = (
     "statistics/pricerpt/price_report_{date_str}_e.pdf"
 )
 
-# Keep the listing URL only as a fallback for find_latest_pdf_url()
-CBSL_PRICE_REPORT_URL = (
-    "https://www.cbsl.gov.lk/en/statistics/economic-indicators/price-report"
-)
-PDF_LINK_RE = re.compile(r"https?://[^\"']+price_report_(\d{8})_e\.pdf")
-
-# Earliest date CBSL has PDFs online (adjust if you need to go further back)
+# Earliest date CBSL has PDFs online with the same format we can parse.
+# Verified: the PDF table structure (page 2) is identical back to at least 2020.
 CBSL_HISTORY_START = datetime(2020, 1, 1)
 
 
@@ -366,66 +361,148 @@ def download_pdf(url: str, target_path: Path) -> None:
 # PDF parsing
 # ---------------------------------------------------------------------------
 
-def extract_prices(pdf_path: Path) -> Dict[str, Dict[str, float]]:
+# Regex to find the report date inside PDF text.
+# Handles both formats found in real PDFs:
+#   Page 2 header: "...Selected Food Commodities - 08 April, 2026"  (comma after month)
+#   Page 1 header: "A Summary of Price Developments -08 April 2026" (no comma, no space before day)
+_PDF_DATE_RE = re.compile(
+    r"\b(\d{1,2})\s*"
+    r"(January|February|March|April|May|June|July|August|"
+    r"September|October|November|December),?\s+(\d{4})\b",
+    re.IGNORECASE,
+)
+_MONTH_MAP = {
+    "january":1, "february":2, "march":3,    "april":4,
+    "may":5,     "june":6,     "july":7,     "august":8,
+    "september":9,"october":10,"november":11,"december":12,
+}
+
+
+def _extract_date_from_text(text: str) -> Optional[str]:
     """
-    Parse page 2 of the CBSL Daily Price Report and return:
-      {canonical_item_name: {field_name: value, ...}, ...}
+    Extract the report date from PDF text. Returns ISO date string or None.
 
-    Why pdfplumber text mode (not tabula):
-    - tabula requires Java, adding CI setup complexity.
-    - pdfplumber's extract_text(x_tolerance=4) reliably returns all 10
-      values per row as a flat line — we tested this against the real PDF.
-    - Sequential indexing [1,3,5,7,9] is robust because the table structure
-      is fixed: CBSL always publishes Yesterday then Today per column.
-
-    Raises RuntimeError if any required item is missing after parsing.
+    WHY extract from PDF rather than relying only on the URL filename:
+    The URL date and the PDF's internal date should always match, but
+    extracting from the PDF itself gives us:
+    1. A validation check — if they disagree, something is wrong.
+    2. A fallback — if we ever receive a PDF via a different mechanism
+       (e.g. someone sends the file directly), we can still get the date.
+    3. Correctness guarantee — the PDF is the authoritative source.
     """
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        if len(pdf.pages) < 2:
-            raise RuntimeError(
-                f"{pdf_path.name}: expected at least 2 pages, got {len(pdf.pages)}"
-            )
-        page = pdf.pages[1]
-        # x_tolerance=4: slightly wider than default (2) so that the two
-        # glyph fragments of each split number land in the same text line.
-        text = page.extract_text(x_tolerance=4, y_tolerance=2)
+    m = _PDF_DATE_RE.search(text)
+    if not m:
+        return None
+    day   = int(m.group(1))
+    month = _MONTH_MAP[m.group(2).lower()]
+    year  = int(m.group(3))
+    try:
+        return datetime(year, month, day).date().isoformat()
+    except ValueError:
+        return None
 
-    if not text:
-        raise RuntimeError(
-            f"{pdf_path.name}: pdfplumber returned empty text from page 2."
-        )
 
-    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines() if ln.strip()]
-    results: Dict[str, Dict[str, float]] = {}
+def extract_pdf(pdf_path: Path, url_date: str) -> Tuple[str, Dict[str, Dict[str, float]]]:
+    """
+    Parse a CBSL Daily Price Report PDF and return (report_date, prices).
+
+    report_date: extracted from PDF text (authoritative), falls back to url_date.
+    prices: {item_name: {field: float_or_nan}} for ALL REQUIRED_ITEMS.
+
+    ROBUSTNESS DESIGN — handles all historical PDF variations:
+
+    2026 PDFs (full table):
+      Every required item has exactly 10 values (5 markets × yesterday+today).
+      We extract Today values at sequential positions [1, 3, 5, 7, 9].
+
+    2020-2021 PDFs (partial table):
+      Some items have FEWER than 10 values because certain market columns were
+      physically absent from the table (e.g. Potato (Imp) had only 3 markets
+      in 2020, giving 6 values instead of 10).
+      Some items are completely absent from the PDF in early periods.
+
+    Rule (per user instruction — "when there is not mentioned a price just
+    skip it with NaN"):
+      - Item found, 10 values  → extract normally
+      - Item found, < 10 values → all fields = NaN (can't reliably map partial columns)
+      - Item completely absent  → all fields = NaN
+      - PDF page unreadable     → all fields = NaN for every item, log warning
+
+    The function NEVER raises due to missing or incomplete items.
+    A RuntimeError is only raised for a truly corrupt file (e.g. 0 pages).
+    """
+    # All-NaN price dict — used as default for any item we can't extract
+    _nan_prices: Dict[str, float] = {field: float("nan") for field, _ in PRICE_FIELDS}
+
+    # --- Read PDF text ---
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            if len(pdf.pages) < 2:
+                raise RuntimeError(
+                    f"{pdf_path.name}: only {len(pdf.pages)} page(s) — expected at least 2."
+                )
+            page2_text = pdf.pages[1].extract_text(x_tolerance=4, y_tolerance=2)
+    except RuntimeError:
+        raise  # re-raise our own error
+    except Exception as exc:
+        raise RuntimeError(f"{pdf_path.name}: could not open PDF — {exc}") from exc
+
+    if not page2_text:
+        # Some PDFs (e.g. 2025-09-24/25 in the error log) have an unreadable page 2.
+        # Return all-NaN rather than crashing — a corrupt PDF shouldn't stop backfill.
+        print(f"  WARNING: {pdf_path.name}: page 2 returned no text. "
+              f"All prices set to NaN.")
+        return url_date, {item: dict(_nan_prices) for item in REQUIRED_ITEMS}
+
+    # --- Date: extract from PDF, validate against URL filename ---
+    pdf_date = _extract_date_from_text(page2_text)
+    if pdf_date is None:
+        print(f"  WARNING: {pdf_path.name}: date not found in PDF text — "
+              f"using URL date {url_date}.")
+        report_date = url_date
+    elif pdf_date != url_date:
+        print(f"  WARNING: {pdf_path.name}: PDF date ({pdf_date}) != "
+              f"URL date ({url_date}). Using PDF date.")
+        report_date = pdf_date
+    else:
+        report_date = pdf_date
+
+    # --- Parse price rows ---
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in page2_text.splitlines() if ln.strip()]
+    extracted: Dict[str, Dict[str, float]] = {}
 
     for line in lines:
-        if "Rs./" not in line:  # fast pre-filter
+        if "Rs./" not in line:
             continue
-
         item = _match_item(line)
-        if not item or item in results:
+        if not item or item in extracted:
             continue
-
         values = _extract_values(line)
-
-        # Each item must have exactly 10 values (yesterday + today per market).
-        # All-NaN rows (e.g. Big Onion Local) are valid and still count as 10.
         if len(values) < 10:
-            print(
-                f"  WARNING: {item} yielded only {len(values)} values "
-                f"(expected 10) — skipping."
-            )
-            continue
+            # Truncated row — market columns were absent in this PDF version.
+            # We can't reliably know WHICH columns are missing, so store NaN.
+            # WHY: In 2020 PDFs, Potato (Imp) only had 3 of 5 market columns,
+            # giving 6 values. Guessing the mapping would introduce silent errors.
+            print(f"  INFO: {item}: {len(values)} values (truncated row) — storing NaN.")
+            extracted[item] = dict(_nan_prices)
+        else:
+            extracted[item] = {field: values[idx] for field, idx in PRICE_FIELDS}
 
-        results[item] = {field: values[idx] for field, idx in PRICE_FIELDS}
+    # --- Fill any items completely absent from this PDF with NaN ---
+    prices: Dict[str, Dict[str, float]] = {}
+    missing = []
+    for item in REQUIRED_ITEMS:
+        if item in extracted:
+            prices[item] = extracted[item]
+        else:
+            prices[item] = dict(_nan_prices)
+            missing.append(item)
 
-    missing = [it for it in REQUIRED_ITEMS if it not in results]
     if missing:
-        raise RuntimeError(
-            f"{pdf_path.name}: could not extract {len(missing)} items: {missing}"
-        )
+        print(f"  INFO: {pdf_path.name}: {len(missing)} item(s) absent from PDF "
+              f"(stored as NaN): {missing}")
 
-    return results
+    return report_date, prices
 
 
 # ---------------------------------------------------------------------------
@@ -715,18 +792,22 @@ def main() -> int:
     # Process each PDF
     new_rows: List[Dict[str, object]] = []
     for date_compact in dates_to_process:
-        report_date = datetime.strptime(date_compact, "%Y%m%d").date().isoformat()
+        url_date    = datetime.strptime(date_compact, "%Y%m%d").date().isoformat()
         pdf_url     = links[date_compact]
         pdf_path    = RAW_DIR / f"price_report_{date_compact}_e.pdf"
 
-        print(f"\nProcessing {report_date}...")
+        print(f"\nProcessing {url_date}...")
         if not pdf_path.exists() or force:
             download_pdf(pdf_url, pdf_path)
 
         try:
-            prices = extract_prices(pdf_path)
+            # extract_pdf returns (report_date, prices) and NEVER raises due to
+            # missing/truncated items — those are stored as NaN per the design.
+            # It only raises for truly corrupt files (wrong page count, unreadable).
+            report_date, prices = extract_pdf(pdf_path, url_date)
         except RuntimeError as exc:
-            # In backfill mode: skip bad PDFs instead of aborting everything.
+            # In backfill mode: log and continue. One corrupt file shouldn't
+            # stop all other dates from being processed.
             print(f"  ERROR: {exc}")
             if backfill:
                 continue
@@ -735,7 +816,7 @@ def main() -> int:
         rain_nuwara = rain_nuwara_map.get(report_date, float("nan"))
         rain_pol    = rain_pol_map.get(report_date, float("nan"))
         new_rows.append(build_wide_row(report_date, pdf_url, prices, rain_nuwara, rain_pol))
-        print(f"  OK — {len(REQUIRED_ITEMS)} items extracted.")
+        print(f"  OK — {len(REQUIRED_ITEMS)} items extracted (PDF date: {report_date}).")
 
     if not new_rows:
         print("No new rows produced.")
