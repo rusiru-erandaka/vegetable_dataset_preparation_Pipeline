@@ -2,7 +2,7 @@
 update_dataset.py
 -----------------
 Pipeline to:
-  1. Scrape the latest Daily Price Report PDF from CBSL.
+  1. Find the latest Daily Price Report PDF from CBSL (by probing predictable URLs).
   2. Extract vegetable / fruit / rice wholesale & retail prices (page 2).
   3. Fetch rainfall data from Open-Meteo for two key farming regions.
   4. Save / update a wide-format CSV dataset.
@@ -15,17 +15,24 @@ Run modes
   python update_dataset.py --backfill --start-date 2024-01-01   # backfill from a specific date
   python update_dataset.py --force                # re-process latest even if already exists
 
-How PDF discovery works (important fix)
-----------------------------------------
-The old approach scraped the CBSL HTML listing page with pagination (?page=0,1,2...).
-This was broken: the CBSL site uses Drupal with a Year/Month filter, and the default
-paginated view only iterates within the currently-selected year. Result: ~45-55% of
-2023 dates were silently missing — NOT holidays, just never found by the scraper.
+PDF discovery
+-------------
+The PDF URL is predictable from the date:
+  .../price_report_YYYYMMDD_e.pdf
+We probe each weekday URL. HTTP 404 = genuine holiday / non-publishing day.
 
-The new approach directly generates the PDF URL from the date (the URL is 100%
-predictable: .../price_report_YYYYMMDD_e.pdf), sends a fast HEAD request to check
-if it exists, and only downloads confirmed PDFs. HTTP 404 = genuine holiday or
-non-publishing day. This gives complete coverage with no pagination complexity.
+FIX (this version): the probe previously used a bare `requests.head()` with the
+default python-requests User-Agent and treated ANY non-200 / any exception as
+"PDF does not exist". From GitHub Actions runners the CBSL server (or its WAF)
+rejects such requests (403 / 405 / timeouts), so every date looked missing and
+the run failed with "No PDF found in the last 10 weekdays".
+The probe now:
+  * sends browser-like headers,
+  * treats only a real 404/410 as "does not exist",
+  * falls back to a streamed GET (checking the %PDF magic bytes) when HEAD is
+    rejected or inconclusive,
+  * retries transient errors, and
+  * reports the real reason when nothing is found.
 
 How the PDF is parsed
 ---------------------
@@ -46,7 +53,6 @@ into two tokens by pdfplumber, e.g.:
   "n.a."   -> ['n.a.']            (not reported)
 
 _extract_values() handles all these patterns reliably.
-Validated against the real 08-Apr-2026 PDF: 24 items x 5 fields = 120/120 correct.
 """
 
 import os
@@ -61,7 +67,7 @@ import pandas as pd
 import requests
 import pdfplumber
 from dotenv import load_dotenv
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, hf_hub_download
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +84,22 @@ PDF_LINK_RE = re.compile(r"https?://[^\"']+price_report_(\d{8})_e\.pdf")
 DATA_DIR = Path("data")
 RAW_DIR = DATA_DIR / "raw"
 CSV_PATH = DATA_DIR / "price_dataset.csv"
+HF_CSV_NAME = "price_dataset.csv"
+
+# Browser-like headers. Many government sites / WAFs reject the default
+# "python-requests/x.y" User-Agent, especially from cloud (datacenter) IPs.
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/pdf,application/xhtml+xml,text/html;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": CBSL_PRICE_REPORT_URL,
+}
+
+SESSION = requests.Session()
+SESSION.headers.update(HTTP_HEADERS)
 
 # Canonical item names — these become column name prefixes in the dataset.
 REQUIRED_ITEMS: List[str] = [
@@ -108,7 +130,6 @@ REQUIRED_ITEMS: List[str] = [
 ]
 
 # Case-insensitive lookup: lowercase_alias -> canonical_name
-# Handles capitalisation differences AND known PDF typos.
 _ITEM_LOWER_MAP: Dict[str, str] = {item.lower(): item for item in REQUIRED_ITEMS}
 _ITEM_LOWER_MAP["red onion (lmp)"] = "Red Onion (Imp)"  # PDF prints 'lmp' not 'Imp'
 _ITEM_LOWER_MAP["snake gourd"] = "Snake Gourd"           # PDF uses lowercase 'gourd'
@@ -132,14 +153,7 @@ POLONNARUWA  = (7.93965, 81.00274)
 # ---------------------------------------------------------------------------
 
 def _match_item(text: str) -> Optional[str]:
-    """
-    Case-insensitive match: is any known item name present in `text`?
-    Returns the canonical name if yes, None if no match.
-
-    WHY: The PDF uses inconsistent capitalisation ('snake gourd', 'Red Onion
-    (lmp)') and the item name may be surrounded by other text on the line.
-    A lower-case substring match is simpler and more robust than exact equality.
-    """
+    """Case-insensitive match: is any known item name present in `text`?"""
     text_lower = text.lower()
     for alias, canonical in _ITEM_LOWER_MAP.items():
         if alias in text_lower:
@@ -149,24 +163,8 @@ def _match_item(text: str) -> Optional[str]:
 
 def _extract_values(line: str) -> List[float]:
     """
-    Extract all price values from one item's text line.
-
-    The CBSL PDF uses a split-glyph rendering: each number's digits are
-    emitted as two separate text tokens by pdfplumber. This function
-    reassembles them.
-
-    Split patterns discovered in the real PDF:
-      '2' + '00.00'  -> 200.00   (3-digit number, split before last 2 digits)
-      '8' + '0.00'   ->  80.00   (2-digit number, split before last 1 digit)
-      '5' + '8.00'   ->  58.00   (same, different tens digit)
-      '1' + '30.00'  -> 130.00   (3-digit, split normally)
-      '1' + ',000.00'-> 1000.00  (4-digit, comma thousands separator also split)
-      '1' + ',025.00'-> 1025.00  (same)
-      'n.a.'         ->  NaN     (value not reported for that market)
-
-    The key regex fix vs. the original code:
-      Original: r"\\d{2,3}\\.\\d{2}"  -- missed 1-digit decimal parts like '0.00'
-      Fixed:    r"\\d{1,3}\\.\\d{2}"  -- handles 1, 2, or 3 digit decimal parts
+    Extract all price values from one item's text line, re-assembling the
+    split-glyph tokens produced by pdfplumber (see module docstring).
     """
     tokens = line.split()
 
@@ -192,7 +190,7 @@ def _extract_values(line: str) -> List[float]:
         if re.fullmatch(r"\d+", t) and i + 1 < len(vt):
             nxt = vt[i + 1]
 
-            # Normal split (1–3 digits before the dot): covers 2-digit and 3-digit prices
+            # Normal split (1–3 digits before the dot)
             if re.fullmatch(r"\d{1,3}\.\d{2}", nxt):
                 values.append(float(t + nxt))
                 i += 2
@@ -210,23 +208,17 @@ def _extract_values(line: str) -> List[float]:
             i += 1
             continue
 
-        i += 1  # skip non-numeric tokens (item name fragments, markers, etc.)
+        i += 1  # skip non-numeric tokens
 
     return values
 
 
 def _http_get(url: str, retries: int = 3, backoff: float = 2.0) -> requests.Response:
-    """
-    HTTP GET with exponential-backoff retry.
-
-    WHY: CBSL and Open-Meteo occasionally return transient errors. Without
-    retry, a single flaky network call would fail the entire GitHub Actions
-    run. Three attempts handles the vast majority of real-world issues.
-    """
+    """HTTP GET with exponential-backoff retry and browser-like headers."""
     last_exc: Optional[Exception] = None
     for attempt in range(retries):
         try:
-            resp = requests.get(url, timeout=30)
+            resp = SESSION.get(url, timeout=30)
             resp.raise_for_status()
             return resp
         except requests.RequestException as exc:
@@ -242,28 +234,12 @@ def _http_get(url: str, retries: int = 3, backoff: float = 2.0) -> requests.Resp
 # PDF discovery & download
 # ---------------------------------------------------------------------------
 
-# The CBSL PDF URL is 100% predictable from the date — no HTML scraping needed.
-# This is the root-cause fix for missing dates:
-#
-# OLD APPROACH (broken): scrape the CBSL listing page, follow pagination.
-#   Problem: the CBSL website (Drupal) has "Filter by Year/Month" dropdowns.
-#   The default view only shows PDFs within the current year's filter, so
-#   paginating ?page=0, ?page=1... only iterates through the current year.
-#   Older years were simply never found, causing ~45-55% data loss in 2023.
-#
-# NEW APPROACH (correct): directly generate every weekday URL by date,
-#   send a HEAD request to check if the PDF exists (fast, no download),
-#   then only download the ones that return HTTP 200.
-#   CBSL holidays produce 404 — that's how we detect genuine non-publishing days.
-#   This gives us 100% coverage with zero dependence on the listing page.
-
 CBSL_PDF_BASE = (
     "https://www.cbsl.gov.lk/sites/default/files/cbslweb_documents/"
     "statistics/pricerpt/price_report_{date_str}_e.pdf"
 )
 
 # Earliest date CBSL has PDFs online with the same format we can parse.
-# Verified: the PDF table structure (page 2) is identical back to at least 2020.
 CBSL_HISTORY_START = datetime(2023, 1, 1)
 
 
@@ -272,20 +248,58 @@ def _pdf_url(date_str: str) -> str:
     return CBSL_PDF_BASE.format(date_str=date_str)
 
 
-def _pdf_exists(url: str) -> bool:
+def _probe_pdf(url: str, retries: int = 3, backoff: float = 2.0) -> Tuple[Optional[bool], str]:
     """
-    Check if a PDF URL exists using a HEAD request (no download).
+    Check whether a PDF exists at `url`.
 
-    WHY HEAD: a HEAD request fetches only the HTTP status code and headers,
-    not the file body. Checking 220 missing dates with HEAD requests is
-    fast (< 1 second per request) vs downloading each full PDF first.
-    Returns True for HTTP 200, False for 404 (holiday / non-publishing day).
+    Returns (exists, reason):
+      (True,  "...")  -> PDF is there (HTTP 200 and genuinely a PDF)
+      (False, "HTTP 404") -> definitively not published (holiday etc.)
+      (None,  "...")  -> INCONCLUSIVE (blocked / network error / server error).
+                         Callers must NOT treat this as "no PDF published".
+
+    Strategy:
+      1. HEAD (cheap). 200 with a non-HTML content-type -> exists. 404/410 -> gone.
+      2. Anything else (403, 405, 5xx, HTML 200 'soft block' page...) -> streamed
+         GET, and check the first bytes are the '%PDF' magic number. Streaming
+         means we read only a few bytes, not the whole file.
+      3. Network exceptions are retried with backoff.
     """
-    try:
-        resp = requests.head(url, timeout=15, allow_redirects=True)
-        return resp.status_code == 200
-    except requests.RequestException:
-        return False
+    last_reason = "no attempt made"
+
+    for attempt in range(retries):
+        try:
+            head = SESSION.head(url, timeout=20, allow_redirects=True)
+            ctype = head.headers.get("Content-Type", "").lower()
+            if head.status_code == 200 and "html" not in ctype:
+                return True, "HTTP 200 (HEAD)"
+            if head.status_code in (404, 410):
+                return False, f"HTTP {head.status_code}"
+            last_reason = f"HEAD returned HTTP {head.status_code} ({ctype or 'no content-type'})"
+
+            # HEAD was rejected or inconclusive -> verify with a streamed GET.
+            with SESSION.get(url, timeout=30, stream=True, allow_redirects=True) as resp:
+                if resp.status_code in (404, 410):
+                    return False, f"HTTP {resp.status_code}"
+                if resp.status_code == 200:
+                    first = next(resp.iter_content(chunk_size=8), b"")
+                    if first.startswith(b"%PDF"):
+                        return True, "HTTP 200 (GET)"
+                    return None, "HTTP 200 but body is not a PDF (blocked / soft-404 page?)"
+                last_reason = f"GET returned HTTP {resp.status_code} (HEAD was {head.status_code})"
+        except requests.RequestException as exc:
+            last_reason = f"{type(exc).__name__}: {exc}"
+
+        if attempt < retries - 1:
+            time.sleep(backoff ** attempt)
+
+    return None, last_reason
+
+
+def _pdf_exists(url: str) -> bool:
+    """True only if the PDF is confirmed to exist."""
+    exists, _ = _probe_pdf(url)
+    return exists is True
 
 
 def list_pdf_links(
@@ -293,67 +307,74 @@ def list_pdf_links(
     end_date: Optional[datetime] = None,
 ) -> Dict[str, str]:
     """
-    Generate and probe every weekday PDF URL between start_date and end_date.
-    Returns {date_str: pdf_url} for every date where the PDF exists (HTTP 200).
-
-    WHY this replaces HTML scraping:
-    The CBSL listing page uses Drupal's Views with a year/month filter. Paginating
-    through ?page=0,1,2... only iterates within the currently-selected year filter,
-    so older years were silently skipped — causing ~45-55% data loss in 2023.
-    Direct URL probing is simpler, faster, and gives 100% coverage.
+    Probe every weekday PDF URL between start_date and end_date.
+    Returns {date_str: pdf_url} for every date where the PDF exists.
     """
     if start_date is None:
         start_date = CBSL_HISTORY_START
     if end_date is None:
         end_date = datetime.utcnow()
 
-    # Generate all weekdays (Mon-Fri) in the range
     weekdays = pd.bdate_range(start=start_date, end=end_date)
 
     links: Dict[str, str] = {}
+    inconclusive = 0
     total = len(weekdays)
-    found = 0
 
     for i, day in enumerate(weekdays):
         date_str = day.strftime("%Y%m%d")
         url = _pdf_url(date_str)
-        if _pdf_exists(url):
+        exists, reason = _probe_pdf(url)
+        if exists:
             links[date_str] = url
-            found += 1
+        elif exists is None:
+            inconclusive += 1
+            print(f"  [warn] {date_str}: probe inconclusive — {reason}")
         if (i + 1) % 50 == 0:
-            print(f"  Probed {i+1}/{total} dates, found {found} PDFs so far...")
+            print(f"  Probed {i+1}/{total} dates, found {len(links)} PDFs so far...")
 
-    print(f"  Done probing: {found}/{total} weekdays have a PDF.")
+    print(f"  Done probing: {len(links)}/{total} weekdays have a PDF "
+          f"({inconclusive} inconclusive).")
+    if inconclusive:
+        print("  NOTE: inconclusive dates are NOT treated as holidays; "
+              "re-run the backfill later to pick them up.")
     return links
 
 
-def find_latest_pdf_url() -> Tuple[str, str]:
+def find_latest_pdf_url(lookback: int = 10) -> Tuple[str, str]:
     """
-    Find the most recent PDF by probing the last 10 weekdays.
-
-    WHY 10 days: CBSL sometimes publishes with a 1-2 day delay. Checking the
-    last 10 weekdays (~2 calendar weeks) guarantees we catch the latest PDF
-    even if there was a holiday cluster or upload delay.
+    Find the most recent PDF by probing the last `lookback` weekdays (newest first).
+    Raises with the real per-date reasons if nothing is found.
     """
-    # Generate last 10 weekdays ending today
     today = datetime.utcnow()
-    last_10 = pd.bdate_range(end=today, periods=10)
+    days = pd.bdate_range(end=today, periods=lookback)
 
-    for day in reversed(last_10):  # newest first
+    reasons: List[str] = []
+    for day in reversed(days):  # newest first
         date_str = day.strftime("%Y%m%d")
         url = _pdf_url(date_str)
-        if _pdf_exists(url):
+        exists, reason = _probe_pdf(url)
+        if exists:
             return url, date_str
+        reasons.append(f"{date_str}: {reason}")
 
-    raise RuntimeError(
-        "No PDF found in the last 10 weekdays. "
-        "CBSL may not have published yet, or check your internet connection."
+    detail = "\n    ".join(reasons)
+    blocked = any("404" not in r and "410" not in r for r in reasons)
+    hint = (
+        "Probes were blocked or failed (not plain 404s) — the CBSL server is likely "
+        "rejecting requests from this runner."
+        if blocked else
+        "Every date returned 404 — CBSL has not published in this window."
     )
+    raise RuntimeError(f"No PDF found in the last {lookback} weekdays. {hint}\n    {detail}")
 
 
 def download_pdf(url: str, target_path: Path) -> None:
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_bytes(_http_get(url).content)
+    content = _http_get(url).content
+    if not content.startswith(b"%PDF"):
+        raise RuntimeError(f"{url}: downloaded content is not a PDF (blocked?).")
+    target_path.write_bytes(content)
     print(f"  Downloaded: {target_path.name}")
 
 
@@ -361,10 +382,6 @@ def download_pdf(url: str, target_path: Path) -> None:
 # PDF parsing
 # ---------------------------------------------------------------------------
 
-# Regex to find the report date inside PDF text.
-# Handles both formats found in real PDFs:
-#   Page 2 header: "...Selected Food Commodities - 08 April, 2026"  (comma after month)
-#   Page 1 header: "A Summary of Price Developments -08 April 2026" (no comma, no space before day)
 _PDF_DATE_RE = re.compile(
     r"\b(\d{1,2})\s*"
     r"(January|February|March|April|May|June|July|August|"
@@ -379,17 +396,7 @@ _MONTH_MAP = {
 
 
 def _extract_date_from_text(text: str) -> Optional[str]:
-    """
-    Extract the report date from PDF text. Returns ISO date string or None.
-
-    WHY extract from PDF rather than relying only on the URL filename:
-    The URL date and the PDF's internal date should always match, but
-    extracting from the PDF itself gives us:
-    1. A validation check — if they disagree, something is wrong.
-    2. A fallback — if we ever receive a PDF via a different mechanism
-       (e.g. someone sends the file directly), we can still get the date.
-    3. Correctness guarantee — the PDF is the authoritative source.
-    """
+    """Extract the report date from PDF text. Returns ISO date string or None."""
     m = _PDF_DATE_RE.search(text)
     if not m:
         return None
@@ -406,35 +413,14 @@ def extract_pdf(pdf_path: Path, url_date: str) -> Tuple[str, Dict[str, Dict[str,
     """
     Parse a CBSL Daily Price Report PDF and return (report_date, prices).
 
-    report_date: extracted from PDF text (authoritative), falls back to url_date.
-    prices: {item_name: {field: float_or_nan}} for ALL REQUIRED_ITEMS.
-
-    ROBUSTNESS DESIGN — handles all historical PDF variations:
-
-    2026 PDFs (full table):
-      Every required item has exactly 10 values (5 markets × yesterday+today).
-      We extract Today values at sequential positions [1, 3, 5, 7, 9].
-
-    2020-2021 PDFs (partial table):
-      Some items have FEWER than 10 values because certain market columns were
-      physically absent from the table (e.g. Potato (Imp) had only 3 markets
-      in 2020, giving 6 values instead of 10).
-      Some items are completely absent from the PDF in early periods.
-
-    Rule (per user instruction — "when there is not mentioned a price just
-    skip it with NaN"):
-      - Item found, 10 values  → extract normally
-      - Item found, < 10 values → all fields = NaN (can't reliably map partial columns)
-      - Item completely absent  → all fields = NaN
-      - PDF page unreadable     → all fields = NaN for every item, log warning
-
-    The function NEVER raises due to missing or incomplete items.
-    A RuntimeError is only raised for a truly corrupt file (e.g. 0 pages).
+    - Item found with 10 values   -> extract normally
+    - Item found with < 10 values -> all fields NaN (partial columns can't be mapped)
+    - Item absent                 -> all fields NaN
+    - Page 2 unreadable           -> all NaN, warning logged
+    Raises RuntimeError only for a truly corrupt file (< 2 pages / cannot open).
     """
-    # All-NaN price dict — used as default for any item we can't extract
     _nan_prices: Dict[str, float] = {field: float("nan") for field, _ in PRICE_FIELDS}
 
-    # --- Read PDF text ---
     try:
         with pdfplumber.open(str(pdf_path)) as pdf:
             if len(pdf.pages) < 2:
@@ -443,18 +429,15 @@ def extract_pdf(pdf_path: Path, url_date: str) -> Tuple[str, Dict[str, Dict[str,
                 )
             page2_text = pdf.pages[1].extract_text(x_tolerance=4, y_tolerance=2)
     except RuntimeError:
-        raise  # re-raise our own error
+        raise
     except Exception as exc:
         raise RuntimeError(f"{pdf_path.name}: could not open PDF — {exc}") from exc
 
     if not page2_text:
-        # Some PDFs (e.g. 2025-09-24/25 in the error log) have an unreadable page 2.
-        # Return all-NaN rather than crashing — a corrupt PDF shouldn't stop backfill.
         print(f"  WARNING: {pdf_path.name}: page 2 returned no text. "
               f"All prices set to NaN.")
         return url_date, {item: dict(_nan_prices) for item in REQUIRED_ITEMS}
 
-    # --- Date: extract from PDF, validate against URL filename ---
     pdf_date = _extract_date_from_text(page2_text)
     if pdf_date is None:
         print(f"  WARNING: {pdf_path.name}: date not found in PDF text — "
@@ -467,7 +450,6 @@ def extract_pdf(pdf_path: Path, url_date: str) -> Tuple[str, Dict[str, Dict[str,
     else:
         report_date = pdf_date
 
-    # --- Parse price rows ---
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in page2_text.splitlines() if ln.strip()]
     extracted: Dict[str, Dict[str, float]] = {}
 
@@ -479,16 +461,11 @@ def extract_pdf(pdf_path: Path, url_date: str) -> Tuple[str, Dict[str, Dict[str,
             continue
         values = _extract_values(line)
         if len(values) < 10:
-            # Truncated row — market columns were absent in this PDF version.
-            # We can't reliably know WHICH columns are missing, so store NaN.
-            # WHY: In 2020 PDFs, Potato (Imp) only had 3 of 5 market columns,
-            # giving 6 values. Guessing the mapping would introduce silent errors.
             print(f"  INFO: {item}: {len(values)} values (truncated row) — storing NaN.")
             extracted[item] = dict(_nan_prices)
         else:
             extracted[item] = {field: values[idx] for field, idx in PRICE_FIELDS}
 
-    # --- Fill any items completely absent from this PDF with NaN ---
     prices: Dict[str, Dict[str, float]] = {}
     missing = []
     for item in REQUIRED_ITEMS:
@@ -512,10 +489,7 @@ def extract_pdf(pdf_path: Path, url_date: str) -> Tuple[str, Dict[str, Dict[str,
 def fetch_precipitation_range(
     start_date: str, end_date: str, lat: float, lon: float
 ) -> Dict[str, float]:
-    """
-    Fetch daily precipitation totals (mm) from Open-Meteo for a date range.
-    Returns {ISO_date: mm_float} for every day in the range.
-    """
+    """Fetch daily precipitation totals (mm) from Open-Meteo for a date range."""
     url = (
         "https://archive-api.open-meteo.com/v1/archive"
         f"?latitude={lat}&longitude={lon}"
@@ -539,10 +513,7 @@ def fetch_precipitation_range(
 # ---------------------------------------------------------------------------
 
 def _col_name(field: str, item: str) -> str:
-    """
-    Build a column name: "retail_pettah_Beans", "wholesale_dambulla_Red_Onion_Imp".
-    Strips parentheses and dots; replaces spaces with underscores.
-    """
+    """Build a column name like "retail_pettah_Beans"."""
     safe = (
         item.replace("(", "")
             .replace(")", "")
@@ -559,14 +530,7 @@ def build_wide_row(
     rain_nuwara: float,
     rain_polonnaruwa: float,
 ) -> Dict[str, object]:
-    """
-    Assemble one wide-format CSV row for a single report date.
-
-    WHY wide format: the target schema (Image 2) places each item-market
-    combination as its own column, with one row per date. This is also the
-    most convenient layout when each date's data is consumed as a single
-    ML feature vector.
-    """
+    """Assemble one wide-format CSV row for a single report date."""
     row: Dict[str, object] = {
         "date": report_date,
         "rainfall_nuwara_eliya_mm": rain_nuwara,
@@ -583,9 +547,6 @@ def build_wide_row(
 # CSV persistence
 # ---------------------------------------------------------------------------
 
-# Columns that the old long-format pipeline wrote but the wide-format pipeline
-# does NOT use. These are dropped automatically when loading any existing CSV,
-# so old files are migrated on first run without any manual intervention.
 _LEGACY_COLUMNS = [
     "item", "unit",
     "retail_pettah", "retail_dambulla", "retail_narahenpita",
@@ -593,72 +554,77 @@ _LEGACY_COLUMNS = [
 ]
 
 
+def restore_from_huggingface() -> bool:
+    """
+    If the local CSV is missing (e.g. the GitHub Actions cache was evicted),
+    pull the last published copy from Hugging Face so we never overwrite the
+    full history with a one-row file.
+    """
+    load_dotenv()
+    repo_id = os.getenv("HF_DATASET_REPO")
+    token   = os.getenv("HF_TOKEN")
+    if not repo_id or not token:
+        return False
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        hf_hub_download(
+            repo_id=repo_id,
+            filename=HF_CSV_NAME,
+            repo_type="dataset",
+            token=token,
+            local_dir=str(DATA_DIR),
+        )
+        print(f"  [restore] Local CSV was missing — restored from Hugging Face ({repo_id}).")
+        return CSV_PATH.exists()
+    except Exception as exc:  # repo/file may not exist yet on a first-ever run
+        print(f"  [restore] Could not restore from Hugging Face: {exc}")
+        return False
+
+
 def load_existing_df() -> pd.DataFrame:
     """
-    Load the existing CSV, auto-migrating away from the old long format.
+    Load the existing CSV and normalise it.
 
-    WHY: The first version of this pipeline wrote one row per item per date
-    (long format) with generic column names like 'retail_pettah'. After
-    switching to wide format those columns became empty ghosts in the CSV.
-    Dropping them here means the dataset self-heals on any machine without
-    needing a separate migration script.
-
-    Also drops any rows that have no wide-format price data at all — these
-    are rows that were written by the old pipeline for dates where the new
-    pipeline hasn't run yet.
+    - Restores from Hugging Face if the local file is missing.
+    - Drops legacy long-format columns.
+    - Drops forward-filled rows (is_interpolated == True). They are regenerated
+      by fill_missing_dates(); keeping them would make the pipeline believe a
+      holiday was a real publication and block real data from replacing it.
+    - Drops rows with no price data at all.
     """
     if not CSV_PATH.exists():
-        return pd.DataFrame()
+        if not restore_from_huggingface():
+            return pd.DataFrame()
 
-    df = pd.read_csv(CSV_PATH).copy()  # .copy() defragments the wide DataFrame
+    df = pd.read_csv(CSV_PATH).copy()
 
-    # Drop legacy columns if present (silently ignore if already gone)
     legacy_present = [c for c in _LEGACY_COLUMNS if c in df.columns]
     if legacy_present:
         print(f"  [migrate] Dropping {len(legacy_present)} legacy columns: {legacy_present}")
         df = df.drop(columns=legacy_present)
 
-    # Drop rows that have no wide-format price data.
-    # We use wholesale_pettah_Beans as a sentinel — it is always populated
-    # for any correctly-processed date.
-    sentinel = "wholesale_pettah_Beans"
-    if sentinel in df.columns:
-        bad_rows = df[sentinel].isna().sum()
-        if bad_rows:
-            print(f"  [migrate] Dropping {bad_rows} rows with no wide-format data.")
-            df = df[df[sentinel].notna()]
+    if "is_interpolated" in df.columns:
+        interp = df["is_interpolated"].astype(str).str.lower().eq("true")
+        if interp.any():
+            print(f"  [load] Dropping {int(interp.sum())} forward-filled rows "
+                  f"(they are regenerated on save).")
+        df = df[~interp].drop(columns=["is_interpolated"])
+
+    price_cols = [c for c in df.columns if c.startswith(("wholesale_", "retail_"))]
+    if price_cols:
+        no_data = df[price_cols].isna().all(axis=1)
+        if no_data.any():
+            print(f"  [migrate] Dropping {int(no_data.sum())} rows with no price data.")
+            df = df[~no_data]
 
     return df.reset_index(drop=True)
 
 
 def fill_missing_dates(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fill gaps in the dataset caused by CBSL not publishing on public holidays.
-
-    WHY this happens
-    ----------------
-    CBSL publishes a price report every weekday EXCEPT Sri Lanka public
-    holidays (Poya days, Sinhala/Tamil New Year, Christmas, etc.). Gaps
-    of 1-12 days are entirely expected — NOT scraping failures.
-    Analysis of the real dataset confirms all large gaps align with known
-    Sri Lanka holiday clusters (New Year week, Wesak, Poya days, etc.).
-
-    WHY forward-fill is the right approach
-    ---------------------------------------
-    Prices don't jump to zero on a holiday — the last known market price
-    is the best estimate for that day. Forward-fill (ffill) is the standard
-    technique for daily financial/commodity price datasets: carry the last
-    published value forward until a new publication arrives.
-
-    What we do
-    ----------
-    1. Reindex to a complete daily calendar (no gaps).
-    2. Mark newly inserted rows with is_interpolated=True BEFORE filling,
-       so consumers can always distinguish real publications from filled rows.
-    3. Forward-fill all price and metadata columns.
-
-    The 'source_pdf' on interpolated rows points to the PDF whose prices
-    were carried forward — useful for debugging and traceability.
+    Fill gaps caused by CBSL not publishing on public holidays by forward-filling
+    the last published values, and flag those rows with is_interpolated=True.
+    `df` must contain only REAL publications (load_existing_df guarantees this).
     """
     if df.empty:
         return df
@@ -670,15 +636,12 @@ def fill_missing_dates(df: pd.DataFrame) -> pd.DataFrame:
     full_range = pd.date_range(start=df.index.min(), end=df.index.max(), freq="D")
     added_days = len(full_range) - len(df)
 
-    # Reindex — missing dates become rows of NaN
     df = df.reindex(full_range)
     df.index.name = "date"
 
-    # Mark interpolated rows BEFORE ffill using source_pdf as the indicator:
-    # if source_pdf is NaN, CBSL did not publish that day.
+    # source_pdf is NaN only on rows that did not exist before reindexing.
     df["is_interpolated"] = df["source_pdf"].isna()
 
-    # Forward-fill everything except the flag
     fill_cols = [c for c in df.columns if c != "is_interpolated"]
     df[fill_cols] = df[fill_cols].ffill()
 
@@ -703,11 +666,7 @@ def save_csv(df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 
 def push_to_huggingface() -> None:
-    """
-    Upload price_dataset.csv to a Hugging Face dataset repo.
-    Reads HF_DATASET_REPO and HF_TOKEN from environment / .env file.
-    In GitHub Actions these are set as repository secrets.
-    """
+    """Upload price_dataset.csv to a Hugging Face dataset repo."""
     load_dotenv()
     repo_id = os.getenv("HF_DATASET_REPO")
     token   = os.getenv("HF_TOKEN")
@@ -718,7 +677,7 @@ def push_to_huggingface() -> None:
     api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
     api.upload_file(
         path_or_fileobj=str(CSV_PATH),
-        path_in_repo="price_dataset.csv",
+        path_in_repo=HF_CSV_NAME,
         repo_id=repo_id,
         repo_type="dataset",
         commit_message=f"Auto-update: {datetime.utcnow().strftime('%Y-%m-%d')}",
@@ -734,32 +693,20 @@ def main() -> int:
     force    = "--force"    in sys.argv
     backfill = "--backfill" in sys.argv
 
-    # Optional: --start-date YYYY-MM-DD lets you backfill from a specific date
-    # instead of the full CBSL_HISTORY_START. Useful to fill only recent gaps.
     start_date_override: Optional[datetime] = None
     if "--start-date" in sys.argv:
         idx = sys.argv.index("--start-date")
         if idx + 1 < len(sys.argv):
             start_date_override = datetime.strptime(sys.argv[idx + 1], "%Y-%m-%d")
 
+    # load_existing_df() returns REAL publications only (forward-filled rows
+    # are dropped and regenerated on save).
     existing_df = load_existing_df()
-    # Only treat a date as "already processed" if it came from a real CBSL
-    # publication — not from forward-fill. This ensures that if today was
-    # previously forward-filled, the pipeline still processes the real PDF
-    # when it becomes available.
-    if not existing_df.empty and "is_interpolated" in existing_df.columns:
-        real_rows = existing_df[existing_df["is_interpolated"] == False]
-        existing_dates: set = set(real_rows["date"].astype(str).unique())
-    else:
-        existing_dates = (
-            set(existing_df["date"].astype(str).unique()) if not existing_df.empty else set()
-        )
+    existing_dates: set = (
+        set(existing_df["date"].astype(str).unique()) if not existing_df.empty else set()
+    )
 
-    # Decide which PDFs to process
     if backfill:
-        # Probe every weekday URL directly — no HTML scraping, no pagination bugs.
-        # 404 = holiday or non-publishing day (correctly skipped).
-        # 200 = PDF exists, add to queue.
         start = start_date_override or CBSL_HISTORY_START
         print(f"Backfill: probing all weekday URLs from {start.date()} to today...")
         links = list_pdf_links(start_date=start)
@@ -782,14 +729,12 @@ def main() -> int:
         links = {date_compact: latest_url}
         dates_to_process = [date_compact]
 
-    # Batch-fetch rainfall for all dates at once (one API call per region)
     iso_dates  = [datetime.strptime(d, "%Y%m%d").date().isoformat() for d in dates_to_process]
     start_date, end_date = min(iso_dates), max(iso_dates)
     print(f"Fetching rainfall {start_date} -> {end_date}...")
     rain_nuwara_map = fetch_precipitation_range(start_date, end_date, *NUWARA_ELIYA)
     rain_pol_map    = fetch_precipitation_range(start_date, end_date, *POLONNARUWA)
 
-    # Process each PDF
     new_rows: List[Dict[str, object]] = []
     for date_compact in dates_to_process:
         url_date    = datetime.strptime(date_compact, "%Y%m%d").date().isoformat()
@@ -797,17 +742,11 @@ def main() -> int:
         pdf_path    = RAW_DIR / f"price_report_{date_compact}_e.pdf"
 
         print(f"\nProcessing {url_date}...")
-        if not pdf_path.exists() or force:
-            download_pdf(pdf_url, pdf_path)
-
         try:
-            # extract_pdf returns (report_date, prices) and NEVER raises due to
-            # missing/truncated items — those are stored as NaN per the design.
-            # It only raises for truly corrupt files (wrong page count, unreadable).
+            if not pdf_path.exists() or force:
+                download_pdf(pdf_url, pdf_path)
             report_date, prices = extract_pdf(pdf_path, url_date)
         except RuntimeError as exc:
-            # In backfill mode: log and continue. One corrupt file shouldn't
-            # stop all other dates from being processed.
             print(f"  ERROR: {exc}")
             if backfill:
                 continue
@@ -824,7 +763,6 @@ def main() -> int:
 
     new_df = pd.DataFrame(new_rows)
 
-    # Merge: replace any existing rows for dates we just processed
     if not existing_df.empty:
         keep = ~existing_df["date"].isin(new_df["date"].unique())
         combined = pd.concat([existing_df[keep], new_df], ignore_index=True).copy()
