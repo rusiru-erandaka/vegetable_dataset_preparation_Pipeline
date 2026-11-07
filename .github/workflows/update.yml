@@ -1,22 +1,15 @@
 # .github/workflows/update_dataset.yml
 #
-# This workflow runs automatically every weekday at 8:00 AM Sri Lanka time
-# (02:30 UTC, since Sri Lanka is UTC+5:30). CBSL typically publishes the
-# daily price report in the morning, so this timing gives them time to upload.
-#
-# It can also be triggered manually from the GitHub Actions UI
-# (useful for testing or forcing a backfill).
+# Runs every weekday at 8:00 AM Sri Lanka time (02:30 UTC) and can also be
+# triggered manually from the GitHub Actions UI (latest / backfill / force).
 
 name: Update CBSL Price Dataset
 
 on:
   schedule:
-    # Cron syntax: minute hour day month weekday (all in UTC)
-    # 02:30 UTC = 08:00 AM Sri Lanka time (UTC+5:30)
-    # "1-5" means Monday–Friday only (weekdays)
+    # minute hour day month weekday (UTC). 02:30 UTC = 08:00 AM Sri Lanka time.
     - cron: "30 2 * * 1-5"
 
-  # Allow manual runs from the GitHub Actions tab
   workflow_dispatch:
     inputs:
       mode:
@@ -37,51 +30,26 @@ jobs:
   update:
     name: Extract prices and push to Hugging Face
     runs-on: ubuntu-latest
+    timeout-minutes: 60   # a full backfill probes ~900 URLs; don't let a hang burn runner time
 
     steps:
-      # -----------------------------------------------------------------------
-      # 1. Check out the repository code
-      # -----------------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # -----------------------------------------------------------------------
-      # 2. Set up Python
-      # -----------------------------------------------------------------------
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"   # Cache pip downloads between runs to speed up CI
+          cache: "pip"
 
-      # -----------------------------------------------------------------------
-      # 3. Install Java (required by tabula-py for PDF table extraction)
-      #    We use the Temurin (Eclipse) distribution — it's free and reliable.
-      # -----------------------------------------------------------------------
-      - name: Set up Java 17 (for tabula-py)
-        uses: actions/setup-java@v4
-        with:
-          distribution: "temurin"
-          java-version: "17"
+      # (Java removed: the script uses pdfplumber only, tabula-py is not needed.)
+      # requirements.txt: pdfplumber, pandas, requests, huggingface_hub, python-dotenv
 
-      # -----------------------------------------------------------------------
-      # 4. Install Python dependencies
-      #    requirements.txt should list:
-      #      pdfplumber, tabula-py, pandas, requests, huggingface_hub,
-      #      python-dotenv
-      # -----------------------------------------------------------------------
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      # -----------------------------------------------------------------------
-      # 5. Restore the cached dataset CSV from the previous run.
-      #
-      #    WHY: We don't store the CSV in git (it changes every day and would
-      #    bloat the repository). Instead we cache it between workflow runs.
-      #    The cache key includes the date so a fresh cache slot is created
-      #    each day, but the "restore-keys" prefix means we always start from
-      #    the most recent previous run's file if today's doesn't exist yet.
-      # -----------------------------------------------------------------------
+      # Cached CSV from the previous run. If the cache is evicted, the script
+      # now restores the last published CSV from Hugging Face automatically.
       - name: Restore dataset cache
         uses: actions/cache@v4
         with:
@@ -90,12 +58,6 @@ jobs:
           restore-keys: |
             price-dataset-${{ runner.os }}-
 
-      # -----------------------------------------------------------------------
-      # 6. Run the update script
-      #
-      #    The mode input from workflow_dispatch controls the arguments.
-      #    On a scheduled run (no input), it defaults to "latest".
-      # -----------------------------------------------------------------------
       - name: Run update_dataset.py
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -114,30 +76,18 @@ jobs:
             ARGS="--force"
           fi
 
-          echo "Running: python update_dataset.py $ARGS"
+          echo "Running: python scripts/update_dataset.py $ARGS"
           python scripts/update_dataset.py $ARGS
 
-      # -----------------------------------------------------------------------
-      # 7. Upload the updated CSV as a GitHub Actions artifact.
-      #
-      #    WHY: Even though the CSV is pushed to Hugging Face, keeping it as
-      #    a workflow artifact means you can download and inspect it directly
-      #    from the GitHub Actions run page without touching HF. Retained
-      #    for 30 days.
-      # -----------------------------------------------------------------------
       - name: Upload dataset artifact
         uses: actions/upload-artifact@v4
-        if: always()   # Upload even if a previous step soft-failed
+        if: always()
         with:
           name: price-dataset-${{ github.run_id }}
           path: data/price_dataset.csv
           retention-days: 30
+          if-no-files-found: ignore
 
-      # -----------------------------------------------------------------------
-      # 8. Report failure clearly if the script exits non-zero.
-      #    GitHub will mark the run as failed automatically, but this step
-      #    prints a visible summary in the Actions log.
-      # -----------------------------------------------------------------------
       - name: Check exit status
         if: failure()
         run: |
