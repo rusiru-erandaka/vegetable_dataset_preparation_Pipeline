@@ -98,8 +98,30 @@ HTTP_HEADERS = {
     "Referer": CBSL_PRICE_REPORT_URL,
 }
 
-SESSION = requests.Session()
-SESSION.headers.update(HTTP_HEADERS)
+def _make_session():
+    """
+    Prefer curl_cffi, which impersonates Chrome's TLS/HTTP2 fingerprint. Bot
+    protection (WAF) in front of sites like cbsl.gov.lk often blocks the
+    fingerprint of python-requests even when the headers look like a browser.
+    Falls back to plain requests if curl_cffi is not installed.
+    """
+    try:
+        from curl_cffi import requests as curl_requests
+        sess = curl_requests.Session(impersonate="chrome")
+        sess.headers.update({
+            "Accept-Language": HTTP_HEADERS["Accept-Language"],
+            "Referer": HTTP_HEADERS["Referer"],
+        })
+        print("  [http] using curl_cffi (Chrome impersonation)")
+        return sess
+    except Exception as exc:
+        print(f"  [http] curl_cffi unavailable ({exc}); using plain requests")
+        sess = requests.Session()
+        sess.headers.update(HTTP_HEADERS)
+        return sess
+
+
+SESSION = _make_session()
 
 # Canonical item names — these become column name prefixes in the dataset.
 REQUIRED_ITEMS: List[str] = [
@@ -221,7 +243,7 @@ def _http_get(url: str, retries: int = 3, backoff: float = 2.0) -> requests.Resp
             resp = SESSION.get(url, timeout=30)
             resp.raise_for_status()
             return resp
-        except requests.RequestException as exc:
+        except Exception as exc:  # requests and curl_cffi raise different types
             last_exc = exc
             if attempt < retries - 1:
                 wait = backoff ** attempt
@@ -278,16 +300,22 @@ def _probe_pdf(url: str, retries: int = 3, backoff: float = 2.0) -> Tuple[Option
             last_reason = f"HEAD returned HTTP {head.status_code} ({ctype or 'no content-type'})"
 
             # HEAD was rejected or inconclusive -> verify with a streamed GET.
-            with SESSION.get(url, timeout=30, stream=True, allow_redirects=True) as resp:
+            resp = SESSION.get(url, timeout=30, stream=True, allow_redirects=True)
+            try:
                 if resp.status_code in (404, 410):
                     return False, f"HTTP {resp.status_code}"
                 if resp.status_code == 200:
-                    first = next(resp.iter_content(chunk_size=8), b"")
+                    first = next(iter(resp.iter_content(chunk_size=8)), b"")
                     if first.startswith(b"%PDF"):
                         return True, "HTTP 200 (GET)"
                     return None, "HTTP 200 but body is not a PDF (blocked / soft-404 page?)"
                 last_reason = f"GET returned HTTP {resp.status_code} (HEAD was {head.status_code})"
-        except requests.RequestException as exc:
+                if resp.status_code in (401, 403):
+                    # Access denied is not transient — retrying just wastes time.
+                    return None, last_reason
+            finally:
+                resp.close()
+        except Exception as exc:  # requests and curl_cffi raise different types
             last_reason = f"{type(exc).__name__}: {exc}"
 
         if attempt < retries - 1:
@@ -330,6 +358,13 @@ def list_pdf_links(
         elif exists is None:
             inconclusive += 1
             print(f"  [warn] {date_str}: probe inconclusive — {reason}")
+            # Fail fast: if the first several probes are all blocked, the server
+            # is rejecting us — don't spend an hour probing ~900 more URLs.
+            if inconclusive >= 5 and not links:
+                raise RuntimeError(
+                    f"CBSL is blocking this machine ({reason}). First {inconclusive} "
+                    f"probes were all rejected and none succeeded. Nothing was fetched."
+                )
         if (i + 1) % 50 == 0:
             print(f"  Probed {i+1}/{total} dates, found {len(links)} PDFs so far...")
 
@@ -710,6 +745,11 @@ def main() -> int:
         start = start_date_override or CBSL_HISTORY_START
         print(f"Backfill: probing all weekday URLs from {start.date()} to today...")
         links = list_pdf_links(start_date=start)
+        if not links:
+            # Previously this fell through to "all dates already present" and the
+            # run ended green with nothing pushed. An empty probe is a failure.
+            print("ERROR: no PDFs were found at all — nothing to backfill.")
+            return 1
         dates_to_process = sorted(links.keys())
         if not force:
             dates_to_process = [
